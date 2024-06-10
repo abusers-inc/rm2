@@ -1,0 +1,10 @@
+[workspace]
+members = ["cli", "daemon", "shared"]
+resolver = "2"
+
+
+[workspace.dependencies]
+interprocess = {version = "2.1.1", features = ["tokio"]}
+tokio = {version = "1.38.0"}
+serde = {version = "1.0.203"}
+thiserror = "1.0.61"
