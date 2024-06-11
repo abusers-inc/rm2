@@ -2,9 +2,11 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 pub const DAEMON_SOCKET_NAME: &str = "rm2daemon.sock";
 
-#[derive(Serialize, Deserialize)]
+pub type ProcID = u32;
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct CircuitBreakerOptions {}
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ProcessOptions {
     pub save_logs: bool,
 
@@ -12,7 +14,7 @@ pub struct ProcessOptions {
     pub circuit_breaker: Option<CircuitBreakerOptions>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ProcessConfig {
     pub path: std::path::PathBuf,
     pub args: Vec<String>,
@@ -22,14 +24,14 @@ pub struct ProcessConfig {
     pub options: ProcessOptions,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Process {
-    pub id: u64,
+    pub id: ProcID,
     #[serde(flatten)]
     pub config: ProcessConfig,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub enum Status {
     Starting,
     Running { pid: u32 },
@@ -37,7 +39,7 @@ pub enum Status {
     Crashed { code: Option<i32> },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub enum CircuitBreakerState {
     Open,
     HalfOpen,
@@ -45,32 +47,45 @@ pub enum CircuitBreakerState {
 }
 
 /// Defines how to select process(-es) from pool
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub enum Selector {
     All,
     Group(String),
-    Particular { id: u64 },
+    Particular { id: ProcID },
 }
 
 /// Runtime state of process
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ProcessState {
     pub status: Status,
 
     // Option because process might opted-out of circuit breaker
     pub circuit_breaker_state: Option<CircuitBreakerState>,
 }
-pub trait BytesFormat {
-    type SerError: serde::ser::Error;
-    type DeError: serde::de::Error;
+pub trait BytesFormat: std::fmt::Debug {
+    type SerError: serde::ser::Error + std::fmt::Debug;
+    type DeError: serde::de::Error + std::fmt::Debug;
 
     fn serialize_bytes(&self, input: &impl Serialize) -> Result<Vec<u8>, Self::SerError>;
     fn deserialize_bytes<T: DeserializeOwned>(&self, input: &[u8]) -> Result<T, Self::DeError>;
 }
 
 pub mod proto {
-
     //! Protocol of daemon-client communications
+    pub const LOG_BUFFER_SIZE: usize = 128;
+
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub enum LogKind {
+        Stdout,
+        Stderr,
+    }
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+
+    pub struct Log {
+        pub process: ProcID,
+        pub kind: LogKind,
+        pub data: Vec<u8>,
+    }
 
     #[derive(Serialize, Deserialize)]
     pub enum SubscriptionKind {
@@ -85,7 +100,7 @@ pub mod proto {
     pub enum DaemonMessage {
         Pong,
         AllProcesses(Vec<(Process, ProcessState)>),
-        StateUpdate { id: u64, state: ProcessState },
+        StateUpdate { id: ProcID, state: ProcessState },
     }
 
     #[derive(Serialize, Deserialize)]
@@ -112,10 +127,7 @@ pub mod proto {
 
         CreateProcess(ProcessConfig),
 
-        UpdateProcess {
-            new_config: ProcessConfig,
-            id: u64,
-        },
+        UpdateProcessConfig(Process),
 
         Act {
             action: ProcessAction,
@@ -189,6 +201,7 @@ pub mod formats {
 
     use crate::BytesFormat;
 
+    #[derive(Debug)]
     pub struct MessagePack;
     impl crate::BytesFormat for MessagePack {
         type SerError = rmp_serde::encode::Error;
@@ -226,6 +239,8 @@ pub mod formats {
     //         todo!()
     //     }
     // }
+    #[derive(Debug)]
+
     pub struct Toml;
 
     impl crate::BytesFormat for Toml {
