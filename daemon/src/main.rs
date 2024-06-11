@@ -22,7 +22,8 @@ pub struct DaemonProcess {
 mod logger {
     use std::convert::Infallible;
 
-    use shared::proto::Log;
+    use shared::proto::{Log, LogKind};
+    use shared::ProcID;
     use shared::{proto::ProcessAction, ProcessConfig, ProcessState};
     use tokio::io::AsyncReadExt;
     use tokio::sync::broadcast;
@@ -52,7 +53,9 @@ mod logger {
     }
 
     pub struct Logger {
+        proc_id: ProcID,
         vent: broadcast::Sender<Log>,
+
         stream: ProcessStreams,
     }
 
@@ -61,16 +64,52 @@ mod logger {
         pub fn new(
             vent: broadcast::Sender<Log>,
             streams: ProcessStreams,
+            proc_id: ProcID,
         ) -> tokio::task::JoinHandle<std::io::Error> {
             tokio::task::spawn(async move {
                 return Self {
                     vent,
                     stream: streams,
+                    proc_id,
                 }
                 .work()
                 .await
                 .unwrap_err();
             })
+        }
+
+        async fn process_buffer(&mut self, buffer: &mut Vec<u8>, kind: LogKind) {
+            let mut line_end_index = None;
+            for index in 0..buffer.len() {
+                let current_elem = buffer[index] as char;
+
+                match current_elem {
+                    '\r' => {
+                        if index + 1 < buffer.len() {
+                            if buffer[index + 1] as char == '\n' {
+                                line_end_index = Some(index + 1);
+                                break;
+                            }
+                        }
+                    }
+
+                    '\n' => {
+                        line_end_index = Some(index);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(end_index) = line_end_index {
+                let to_send = buffer.drain(0..=end_index).collect();
+                self.vent
+                    .send(Log {
+                        process: self.proc_id,
+                        kind,
+                        data: to_send,
+                    })
+                    .await;
+            }
         }
 
         pub async fn work(mut self) -> Result<Infallible, std::io::Error> {
@@ -89,6 +128,7 @@ mod logger {
                             stdout_buffer = vec![0; LOG_BUFFER_SIZE];
 
 
+                            self.process_buffer(&mut stdout_buffer_permanent, LogKind::Stdout).await;
 
                         }
                     },
@@ -98,11 +138,8 @@ mod logger {
                             stderr_buffer_permanent.extend(&stderr_buffer[0..read_count]);
                             stderr_buffer = vec![0; LOG_BUFFER_SIZE];
 
+                            self.process_buffer(&mut stderr_buffer_permanent, LogKind::Stderr).await;
 
-                            let mut line_end_index = None;
-                            for index in 0..stderr_buffer_permanent.len() {
-                                // match
-                            }
 
                         }
 
