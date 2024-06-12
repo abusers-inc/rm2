@@ -66,8 +66,8 @@ pub trait BytesFormat: std::fmt::Debug {
     type SerError: serde::ser::Error + std::fmt::Debug;
     type DeError: serde::de::Error + std::fmt::Debug;
 
-    fn serialize_bytes(&self, input: &impl Serialize) -> Result<Vec<u8>, Self::SerError>;
-    fn deserialize_bytes<T: DeserializeOwned>(&self, input: &[u8]) -> Result<T, Self::DeError>;
+    fn serialize_bytes(input: &impl Serialize) -> Result<Vec<u8>, Self::SerError>;
+    fn deserialize_bytes<T: DeserializeOwned>(input: &[u8]) -> Result<T, Self::DeError>;
 }
 
 pub mod proto {
@@ -95,12 +95,18 @@ pub mod proto {
         CircuitBreaker,
     }
 
+    #[derive(Serialize, Deserialize, Clone)]
+    pub enum DaemonNotification {
+        StateUpdate { id: ProcID, state: ProcessState },
+        Log(Log),
+    }
+
     use super::*;
-    #[derive(Serialize, Deserialize)]
+    #[derive(Serialize, Deserialize, Clone)]
     pub enum DaemonMessage {
         Pong,
         AllProcesses(Vec<(Process, ProcessState)>),
-        StateUpdate { id: ProcID, state: ProcessState },
+        Notification(DaemonNotification),
     }
 
     #[derive(Serialize, Deserialize)]
@@ -156,19 +162,22 @@ pub mod proto {
             IO(#[from] std::io::Error),
         }
         pub struct TransportSocket<Pipe: AsyncRead + AsyncWrite + Unpin, Format: BytesFormat> {
-            pipe: Pipe,
-            format: Format,
+            pub pipe: Pipe,
+            pub _f: std::marker::PhantomData<*const Format>,
         }
 
         impl<Pipe: AsyncRead + AsyncWrite + Unpin, Format: BytesFormat> TransportSocket<Pipe, Format> {
+            pub fn new(pipe: Pipe) -> Self {
+                Self {
+                    pipe,
+                    _f: std::marker::PhantomData,
+                }
+            }
             pub async fn send<T: Serialize + for<'a> Deserialize<'a>>(
                 &mut self,
                 msg: &T,
             ) -> Result<(), Error<Format>> {
-                let bytes = self
-                    .format
-                    .serialize_bytes(&msg)
-                    .map_err(|x| Error::Ser(x))?;
+                let bytes = Format::serialize_bytes(&msg).map_err(|x| Error::Ser(x))?;
                 self.pipe.write_u32(bytes.len() as u32).await?;
 
                 self.pipe.write(bytes.as_ref()).await?;
@@ -185,10 +194,8 @@ pub mod proto {
 
                 self.pipe.read_exact(&mut buffer).await?;
 
-                let deserialized = self
-                    .format
-                    .deserialize_bytes(buffer.as_slice())
-                    .map_err(|x| Error::De(x))?;
+                let deserialized =
+                    Format::deserialize_bytes(buffer.as_slice()).map_err(|x| Error::De(x))?;
 
                 Ok(deserialized)
             }
@@ -208,14 +215,11 @@ pub mod formats {
 
         type DeError = rmp_serde::decode::Error;
 
-        fn serialize_bytes(
-            &self,
-            input: &impl serde::Serialize,
-        ) -> Result<Vec<u8>, Self::SerError> {
+        fn serialize_bytes(input: &impl serde::Serialize) -> Result<Vec<u8>, Self::SerError> {
             rmp_serde::encode::to_vec(input)
         }
 
-        fn deserialize_bytes<T: DeserializeOwned>(&self, input: &[u8]) -> Result<T, Self::DeError> {
+        fn deserialize_bytes<T: DeserializeOwned>(input: &[u8]) -> Result<T, Self::DeError> {
             rmp_serde::decode::from_slice(input)
         }
     }
@@ -247,17 +251,13 @@ pub mod formats {
         type SerError = toml::ser::Error;
         type DeError = toml::de::Error;
 
-        fn serialize_bytes(
-            &self,
-            input: &impl serde::Serialize,
-        ) -> Result<Vec<u8>, Self::SerError> {
+        fn serialize_bytes(input: &impl serde::Serialize) -> Result<Vec<u8>, Self::SerError> {
             let as_str = toml::ser::to_string(input)?;
             let as_bytes = as_str.into_bytes();
             Ok(as_bytes)
         }
 
         fn deserialize_bytes<T: serde::de::DeserializeOwned>(
-            &self,
             input: &[u8],
         ) -> Result<T, Self::DeError> {
             // fix unwrap here
@@ -268,4 +268,35 @@ pub mod formats {
     }
 }
 
-use interprocess::local_socket::tokio::prelude::*;
+use interprocess::local_socket::{
+    tokio::prelude::*, traits::tokio::Listener, GenericNamespaced, ListenerOptions, Name, ToNsName,
+};
+use tokio::io::{AsyncRead, AsyncWrite};
+
+pub trait Stream: AsyncRead + AsyncWrite + Sized + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Sized + Unpin> Stream for T {}
+pub trait Listenerlike {
+    type Stream: Stream;
+    async fn accept(&self) -> Result<Self::Stream, std::io::Error>;
+}
+
+impl Listenerlike for LocalSocketListener {
+    type Stream = <Self as Listener>::Stream;
+
+    async fn accept(&self) -> Result<Self::Stream, std::io::Error> {
+        <Self as Listener>::accept(self).await
+    }
+}
+
+fn get_name() -> Name<'static> {
+    DAEMON_SOCKET_NAME
+        .to_ns_name::<GenericNamespaced>()
+        .unwrap()
+}
+pub async fn client_connect() -> Result<impl Stream, std::io::Error> {
+    interprocess::local_socket::tokio::Stream::connect(get_name()).await
+}
+
+pub async fn server_host() -> Result<impl Listenerlike, std::io::Error> {
+    ListenerOptions::new().name(get_name()).create_tokio()
+}

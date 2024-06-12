@@ -1,6 +1,8 @@
 use std::{collections::HashMap, path::PathBuf, process::Stdio};
 
 use interprocess::local_socket::tokio::prelude::*;
+use shared::proto::transport::TransportSocket;
+use shared::proto::{DaemonMessage, DaemonNotification, Log, Subscription};
 use tokio::fs::OpenOptions;
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 mod config;
@@ -65,16 +67,19 @@ mod logger {
             vent: broadcast::Sender<Log>,
             streams: ProcessStreams,
             proc_id: ProcID,
-        ) -> tokio::task::JoinHandle<std::io::Error> {
+        ) -> tokio::task::JoinHandle<(ProcID, std::io::Error)> {
             tokio::task::spawn(async move {
-                return Self {
-                    vent,
-                    stream: streams,
+                return (
                     proc_id,
-                }
-                .work()
-                .await
-                .unwrap_err();
+                    Self {
+                        vent,
+                        stream: streams,
+                        proc_id,
+                    }
+                    .work()
+                    .await
+                    .unwrap_err(),
+                );
             })
         }
 
@@ -150,13 +155,126 @@ mod logger {
     }
 }
 
-use shared::{formats::Toml, *};
-pub struct Daemon<F: BytesFormat> {
-    listener: LocalSocketListener,
+pub mod connection {
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
 
+    use shared::{
+        proto::{
+            self,
+            transport::{self, TransportSocket},
+            ClientMessage, DaemonMessage, Subscription,
+        },
+        BytesFormat, Listenerlike, Stream,
+    };
+    use tokio::sync::Mutex;
+
+    use super::logger::Duplex;
+
+    type ConnId = u64;
+
+    fn assign_connection_id() -> ConnId {
+        static ID_COUNTER: std::sync::Mutex<ConnId> = std::sync::Mutex::new(0);
+        let mut lock = ID_COUNTER.lock().unwrap();
+        let old = *lock;
+        *lock += 1;
+        old
+    }
+
+    const MANAGER_BUFFER: usize = 10_000;
+
+    struct Connection<Format: BytesFormat> {
+        id: ConnId,
+        subscriptions: Vec<Subscription>,
+        send_chan: mpsc::Sender<DaemonMessage>,
+        task: tokio::task::JoinHandle<transport::Error<Format>>,
+    }
+
+    impl<S: Stream, F: BytesFormat> Connection<F> {
+        pub fn new(
+            id: ConnId,
+            socket_chan: mpsc::Sender<(ConnId, ClientMessage)>,
+            daemon_chan: mpsc::Receiver<DaemonMessage>,
+        ) -> Self {
+        }
+
+        async fn work(
+            id: ConnId,
+            mut socket_chan: mpsc::Sender<(ConnId, ClientMessage)>,
+            mut daemon_chan: mpsc::Receiver<DaemonMessage>,
+            mut conn: TransportSocket<S, F>,
+        ) -> Result<std::convert::Infallible, transport::Error<F>> {
+            loop {
+                tokio::select! {
+                    conn_msg = conn.recv::<ClientMessage>() => {
+                        let conn_msg = conn_msg?;
+
+                        socket_chan.send((id, conn_msg)).await.unwrap();
+                    }
+
+                    daemon_msg = daemon_chan.recv() => {
+                        let daemon_msg = daemon_msg?;
+
+                        conn.send(daemon_msg).await.unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    pub struct ConnectionManager<L: Listenerlike, Format: BytesFormat> {
+        listener: L,
+        connections: Vec<Connection<Format>>,
+        chan: mpsc::Receiver<ClientMessage>,
+
+        // for clonning purposes
+        _send: mpsc::Sender<ClientMessage>,
+        __format: std::marker::PhantomData<*const Format>,
+    }
+
+    impl<L: Listenerlike, Format: BytesFormat> ConnectionManager<L, Format> {
+        pub fn new(listener: L) -> Self {
+            let (tx, rx) = mpsc::channel(MANAGER_BUFFER);
+
+            Self {
+                listener,
+                connections: Vec::new(),
+                chan: rx,
+                _send: tx,
+                __format: std::marker::PhantomData,
+            }
+        }
+
+        pub async fn listen(listener: &mut L) -> Result<L::Stream, std::io::Error> {
+            let new_stream = listener.accept().await?;
+            Ok(new_stream)
+        }
+
+        pub async fn run(&mut self) {
+            loop {
+                tokio::select! {
+                   msg_from_conn = self.chan.recv() => {
+
+                   }
+
+                   new_conn = self.listen(&mut self.listener) {
+                        let new_conn = new_conn?;
+                        self.connections.push(Connection {})
+                   }
+                }
+            }
+        }
+    }
+}
+
+use shared::{formats::Toml, *};
+use tokio::sync::broadcast;
+pub struct Daemon<F: BytesFormat> {
     proc_configs: config::Manager<F, Vec<Process>>,
 
     processes: HashMap<ProcID, DaemonProcess>,
+
+    log_pipe: broadcast::Receiver<Log>,
 }
 
 impl<F: BytesFormat> Daemon<F> {
@@ -194,8 +312,10 @@ impl<F: BytesFormat> Daemon<F> {
             .spawn()?;
 
         let entry = ProcessRuntime {
-            stdout: cmd.stdout.take().unwrap(),
-            stderr: cmd.stderr.take().unwrap(),
+            streams: ProcessStreams {
+                stdout: cmd.stdout.take().unwrap(),
+                stderr: cmd.stderr.take().unwrap(),
+            },
             child: cmd,
         };
 
