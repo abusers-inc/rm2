@@ -48,20 +48,14 @@ impl<Format: BytesFormat, Type: DeserializeOwned + Serialize> Manager<Format, Ty
 
             self.file.read_to_end(&mut buffer).await?;
 
-            let d = self
-                .format
-                .deserialize_bytes(&buffer)
-                .map_err(|x| Error::De(x))?;
+            let d = Format::deserialize_bytes(&buffer).map_err(|x| Error::De(x))?;
             self.buffer = Some(d)
         }
         Ok(self.buffer.as_ref().unwrap())
     }
 
     pub async fn write(&mut self, new_item: &Type) -> Result<(), Error<Format>> {
-        let s = self
-            .format
-            .serialize_bytes(new_item)
-            .map_err(|x| Error::Ser(x))?;
+        let s = Format::serialize_bytes(new_item).map_err(|x| Error::Ser(x))?;
 
         self.file.set_len(s.len() as u64).await?;
 

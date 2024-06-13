@@ -102,18 +102,17 @@ mod logger {
                         line_end_index = Some(index);
                         break;
                     }
+                    _ => (),
                 }
             }
 
             if let Some(end_index) = line_end_index {
                 let to_send = buffer.drain(0..=end_index).collect();
-                self.vent
-                    .send(Log {
-                        process: self.proc_id,
-                        kind,
-                        data: to_send,
-                    })
-                    .await;
+                self.vent.send(Log {
+                    process: self.proc_id,
+                    kind,
+                    data: to_send,
+                });
             }
         }
 
@@ -156,16 +155,16 @@ mod logger {
 }
 
 pub mod connection {
-    use std::sync::Arc;
-    use tokio::sync::mpsc;
+    use std::{collections::HashMap, sync::Arc};
+    use tokio::{sync::mpsc, task::JoinSet};
 
     use shared::{
         proto::{
             self,
             transport::{self, TransportSocket},
-            ClientMessage, DaemonMessage, Subscription,
+            ClientMessage, DaemonMessage, DaemonNotification, Subscription,
         },
-        BytesFormat, Listenerlike, Stream,
+        BytesFormat, Listenerlike, Process, Stream,
     };
     use tokio::sync::Mutex;
 
@@ -187,58 +186,92 @@ pub mod connection {
         id: ConnId,
         subscriptions: Vec<Subscription>,
         send_chan: mpsc::Sender<DaemonMessage>,
-        task: tokio::task::JoinHandle<transport::Error<Format>>,
+
+        __format: std::marker::PhantomData<Format>,
     }
 
-    impl<S: Stream, F: BytesFormat> Connection<F> {
-        pub fn new(
+    impl<F: BytesFormat + 'static> Connection<F> {
+        pub fn new<S: Stream + 'static>(
             id: ConnId,
             socket_chan: mpsc::Sender<(ConnId, ClientMessage)>,
-            daemon_chan: mpsc::Receiver<DaemonMessage>,
-        ) -> Self {
+            conn: TransportSocket<S, F>,
+        ) -> (
+            Self,
+            impl std::future::Future<Output = Result<ConnId, (ConnId, transport::Error<F>)>>,
+        ) {
+            let (tx, rx) = mpsc::channel(MANAGER_BUFFER);
+            let task = async move { Self::work(id, socket_chan, rx, conn).await };
+            (
+                Self {
+                    id,
+                    subscriptions: Vec::new(),
+                    send_chan: tx,
+                    __format: std::marker::PhantomData,
+                },
+                task,
+            )
         }
 
-        async fn work(
+        async fn work<S: Stream>(
             id: ConnId,
-            mut socket_chan: mpsc::Sender<(ConnId, ClientMessage)>,
+            socket_chan: mpsc::Sender<(ConnId, ClientMessage)>,
             mut daemon_chan: mpsc::Receiver<DaemonMessage>,
             mut conn: TransportSocket<S, F>,
-        ) -> Result<std::convert::Infallible, transport::Error<F>> {
-            loop {
-                tokio::select! {
-                    conn_msg = conn.recv::<ClientMessage>() => {
-                        let conn_msg = conn_msg?;
+        ) -> Result<ConnId, (ConnId, transport::Error<F>)> {
+            let coroutine = || async move {
+                loop {
+                    tokio::select! {
+                        conn_msg = conn.recv::<ClientMessage>() => {
+                            let conn_msg = conn_msg?;
 
-                        socket_chan.send((id, conn_msg)).await.unwrap();
-                    }
+                            // means network manager was closed
+                            if let Err(_) = socket_chan.send((id, conn_msg)).await {
+                                return Ok(id);
+                            }
+                        }
 
-                    daemon_msg = daemon_chan.recv() => {
-                        let daemon_msg = daemon_msg?;
+                        daemon_msg = daemon_chan.recv() => {
+                            let daemon_msg = match daemon_msg {
+                                Some(msg) => msg,
+                                None => {
+                                    return Ok(id);
+                                }
+                            };
 
-                        conn.send(daemon_msg).await.unwrap();
+                            if let Err(_) = conn.send(&daemon_msg).await {
+                                return Ok(id);
+                            }
+                        }
                     }
                 }
-            }
+            };
+
+            let result = coroutine().await.map_err(|x| (id, x));
+
+            result
         }
     }
 
     pub struct ConnectionManager<L: Listenerlike, Format: BytesFormat> {
         listener: L,
-        connections: Vec<Connection<Format>>,
-        chan: mpsc::Receiver<ClientMessage>,
+        connections: HashMap<ConnId, Connection<Format>>,
+        chan: mpsc::Receiver<(ConnId, ClientMessage)>,
+
+        connections_workers: JoinSet<Result<ConnId, (ConnId, transport::Error<Format>)>>,
 
         // for clonning purposes
-        _send: mpsc::Sender<ClientMessage>,
+        _send: mpsc::Sender<(ConnId, ClientMessage)>,
         __format: std::marker::PhantomData<*const Format>,
     }
 
-    impl<L: Listenerlike, Format: BytesFormat> ConnectionManager<L, Format> {
+    impl<L: Listenerlike, Format: BytesFormat + 'static> ConnectionManager<L, Format> {
         pub fn new(listener: L) -> Self {
             let (tx, rx) = mpsc::channel(MANAGER_BUFFER);
 
             Self {
                 listener,
-                connections: Vec::new(),
+                connections: HashMap::new(),
+                connections_workers: JoinSet::new(),
                 chan: rx,
                 _send: tx,
                 __format: std::marker::PhantomData,
@@ -250,17 +283,89 @@ pub mod connection {
             Ok(new_stream)
         }
 
-        pub async fn run(&mut self) {
+        pub async fn dispatch(&mut self, notif: DaemonNotification, associated_process: &Process) {
+            'conn_loop: for conn in self.connections.values_mut() {
+                for subscription in conn.subscriptions.iter() {
+                    let is_selected = match &subscription.selector {
+                        shared::Selector::All => true,
+                        shared::Selector::Group(group)
+                            if associated_process.config.groups.contains(&group) =>
+                        {
+                            true
+                        }
+                        shared::Selector::Particular { id } if &associated_process.id == id => true,
+                        _ => false,
+                    };
+
+                    if !is_selected {
+                        continue;
+                    }
+
+                    let is_event_matched = cond::cond! {
+                        notif.is_log() && subscription.kind.is_log() => true,
+                        notif.is_state_update() && subscription.kind.is_status() => true,
+
+                      _ => false
+                    };
+
+                    if !is_event_matched {
+                        continue;
+                    }
+
+                    // TODO: Check if error and remove connection if so
+                    conn.send_chan
+                        .send(DaemonMessage::Notification(notif.clone()))
+                        .await;
+
+                    continue 'conn_loop;
+                }
+            }
+        }
+
+        pub async fn run(&mut self) -> (ConnId, ClientMessage) {
             loop {
                 tokio::select! {
                    msg_from_conn = self.chan.recv() => {
+                        let msg = msg_from_conn.expect("We keep a copy of sender, so it should not panic");
 
+                        return msg;
                    }
 
-                   new_conn = self.listen(&mut self.listener) {
-                        let new_conn = new_conn?;
-                        self.connections.push(Connection {})
+                   new_conn = Self::listen(&mut self.listener) => {
+                        let new_conn = match new_conn {
+                            Ok(x) => x,
+                            Err(_) => {continue;}
+                        };
+                        let new_conn_id = assign_connection_id();
+                        let (conn, task) = Connection::new(new_conn_id, self._send.clone(), TransportSocket::<_, Format>::new(new_conn));
+
+                        self.connections_workers.spawn(task);
+
+                        self.connections.insert(new_conn_id, conn);
                    }
+
+                   res = self.connections_workers.join_next() => {
+                        if let Some(res) = res {
+                            match res {
+                                Ok(task_result) => {
+
+                                    let id = match task_result {
+                                        Ok(id) => id,
+                                        Err((id, _)) => id
+                                    };
+                                    // remove connection from pool
+                                    self.connections.remove(&id);
+                                }
+                                Err(err) => {
+                                    if err.is_panic() {
+                                        std::panic::resume_unwind(err.into_panic());
+                                    }
+
+
+                                },
+                            }
+                        }
+                        }
                 }
             }
         }

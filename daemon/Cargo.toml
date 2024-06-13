@@ -12,3 +12,4 @@ shared = {path = "../shared"}
 homedir = "0.2.1"
 thiserror.workspace = true
 serde.workspace = true
+cond = "1.0.5"

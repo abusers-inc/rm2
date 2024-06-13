@@ -12,3 +12,5 @@ interprocess = {workspace = true}
 thiserror.workspace = true
 rmp-serde = "1.3.0"
 toml = "0.8.14"
+strum = "0.26"
+strum_macros = "0.26"

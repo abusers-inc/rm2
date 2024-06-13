@@ -62,9 +62,9 @@ pub struct ProcessState {
     // Option because process might opted-out of circuit breaker
     pub circuit_breaker_state: Option<CircuitBreakerState>,
 }
-pub trait BytesFormat: std::fmt::Debug {
-    type SerError: serde::ser::Error + std::fmt::Debug;
-    type DeError: serde::de::Error + std::fmt::Debug;
+pub trait BytesFormat: std::fmt::Debug + Send + 'static {
+    type SerError: serde::ser::Error + std::fmt::Debug + Send;
+    type DeError: serde::de::Error + std::fmt::Debug + Send;
 
     fn serialize_bytes(input: &impl Serialize) -> Result<Vec<u8>, Self::SerError>;
     fn deserialize_bytes<T: DeserializeOwned>(input: &[u8]) -> Result<T, Self::DeError>;
@@ -87,15 +87,14 @@ pub mod proto {
         pub data: Vec<u8>,
     }
 
-    #[derive(Serialize, Deserialize)]
+    use strum_macros::EnumIs;
+    #[derive(Serialize, Deserialize, EnumIs)]
     pub enum SubscriptionKind {
-        Stdout,
-        Stderr,
+        Log,
         Status,
-        CircuitBreaker,
     }
 
-    #[derive(Serialize, Deserialize, Clone)]
+    #[derive(Serialize, Deserialize, Clone, EnumIs)]
     pub enum DaemonNotification {
         StateUpdate { id: ProcID, state: ProcessState },
         Log(Log),
@@ -161,12 +160,14 @@ pub mod proto {
             De(Format::DeError),
             IO(#[from] std::io::Error),
         }
-        pub struct TransportSocket<Pipe: AsyncRead + AsyncWrite + Unpin, Format: BytesFormat> {
+        pub struct TransportSocket<Pipe: AsyncRead + AsyncWrite + Unpin + Send, Format: BytesFormat> {
             pub pipe: Pipe,
-            pub _f: std::marker::PhantomData<*const Format>,
+            pub _f: std::marker::PhantomData<Format>,
         }
 
-        impl<Pipe: AsyncRead + AsyncWrite + Unpin, Format: BytesFormat> TransportSocket<Pipe, Format> {
+        impl<Pipe: AsyncRead + AsyncWrite + Unpin + Send, Format: BytesFormat>
+            TransportSocket<Pipe, Format>
+        {
             pub fn new(pipe: Pipe) -> Self {
                 Self {
                     pipe,
@@ -273,8 +274,8 @@ use interprocess::local_socket::{
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
-pub trait Stream: AsyncRead + AsyncWrite + Sized + Unpin {}
-impl<T: AsyncRead + AsyncWrite + Sized + Unpin> Stream for T {}
+pub trait Stream: AsyncRead + AsyncWrite + Sized + Unpin + Send + 'static {}
+impl<T: AsyncRead + AsyncWrite + Sized + Unpin + Send + 'static> Stream for T {}
 pub trait Listenerlike {
     type Stream: Stream;
     async fn accept(&self) -> Result<Self::Stream, std::io::Error>;
