@@ -10,6 +10,9 @@ pub struct CircuitBreakerOptions {}
 pub struct ProcessOptions {
     pub save_logs: bool,
 
+    pub auto_start: bool,
+    pub auto_restart: bool,
+
     // if this is None, then circuit breaker is not used
     pub circuit_breaker: Option<CircuitBreakerOptions>,
 }
@@ -37,6 +40,7 @@ pub enum Status {
     Running { pid: u32 },
     Stopped,
     Crashed { code: Option<i32> },
+    FailedToStart,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -120,6 +124,7 @@ pub mod proto {
         Restart,
         Stop,
         OpenCircuitBreaker,
+        UpdateConfig(Process),
     }
     #[derive(Serialize, Deserialize)]
     pub enum ClientMessage {
@@ -131,8 +136,6 @@ pub mod proto {
         Unsubscribe(Subscription),
 
         CreateProcess(ProcessConfig),
-
-        UpdateProcessConfig(Process),
 
         Act {
             action: ProcessAction,

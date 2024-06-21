@@ -13,3 +13,4 @@ homedir = "0.2.1"
 thiserror.workspace = true
 serde.workspace = true
 cond = "1.0.5"
+futures = "0.3.30"

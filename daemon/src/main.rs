@@ -7,20 +7,6 @@ use tokio::fs::OpenOptions;
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 mod config;
 
-pub struct ProcessStreams {
-    stdout: ChildStdout,
-    stderr: ChildStderr,
-}
-pub struct ProcessRuntime {
-    child: Child,
-    streams: ProcessStreams,
-}
-
-pub struct DaemonProcess {
-    runtime: ProcessRuntime,
-    state: ProcessState,
-}
-
 mod logger {
     use std::convert::Infallible;
 
@@ -322,6 +308,12 @@ pub mod connection {
             }
         }
 
+        pub async fn respond(&mut self, conn_id: ConnId, msg: DaemonMessage) {
+            if let Some(conn) = self.connections.get_mut(&conn_id) {
+                conn.send_chan.send(msg).await;
+            }
+        }
+
         pub async fn run(&mut self) -> (ConnId, ClientMessage) {
             loop {
                 tokio::select! {
@@ -372,35 +364,20 @@ pub mod connection {
     }
 }
 
-use shared::{formats::Toml, *};
-use tokio::sync::broadcast;
-pub struct Daemon<F: BytesFormat> {
-    proc_configs: config::Manager<F, Vec<Process>>,
+pub mod processes {
+    use std::{
+        future::{pending, Future},
+        process::{ExitStatus, Stdio},
+    };
 
-    processes: HashMap<ProcID, DaemonProcess>,
+    use futures::future::Either;
+    use shared::{
+        proto::{DaemonNotification, ProcessAction},
+        Process, ProcessConfig, ProcessState, Status,
+    };
+    use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
-    log_pipe: broadcast::Receiver<Log>,
-}
-
-impl<F: BytesFormat> Daemon<F> {
-    pub async fn new(mut config: config::Manager<F, Vec<Process>>) {
-        let proc_configs = config.read().await.unwrap();
-
-        let mut processes = HashMap::new();
-
-        for config in proc_configs.iter() {
-            let runtime = Self::run_process(&config.config).unwrap();
-            let daemon_proc = DaemonProcess {
-                runtime,
-                state: ProcessState {
-                    status: Status::Starting,
-                    circuit_breaker_state: None,
-                },
-            };
-
-            processes.insert(config.id, daemon_proc);
-        }
-    }
+    use crate::logger::Duplex;
 
     fn run_process(config: &ProcessConfig) -> Result<ProcessRuntime, std::io::Error> {
         let parent_dir = {
@@ -417,14 +394,163 @@ impl<F: BytesFormat> Daemon<F> {
             .spawn()?;
 
         let entry = ProcessRuntime {
-            streams: ProcessStreams {
+            streams: Some(ProcessStreams {
                 stdout: cmd.stdout.take().unwrap(),
                 stderr: cmd.stderr.take().unwrap(),
-            },
+            }),
             child: cmd,
         };
 
         Ok(entry)
+    }
+    pub struct ProcessStreams {
+        stdout: ChildStdout,
+        stderr: ChildStderr,
+    }
+    pub struct ProcessRuntime {
+        child: Child,
+        streams: Option<ProcessStreams>,
+    }
+
+    pub struct DaemonProcess {
+        runtime: Option<ProcessRuntime>,
+        state: ProcessState,
+        params: Process,
+    }
+
+    pub struct ProcessSupervisor {
+        process: DaemonProcess,
+        chan: Duplex<DaemonNotification, ProcessAction>,
+    }
+
+    impl ProcessSupervisor {
+        pub async fn new(
+            proc: Process,
+            chan: Duplex<DaemonNotification, ProcessAction>,
+        ) -> Result<Self, std::io::Error> {
+            let mut runtime = None;
+            let mut state = ProcessState {
+                status: Status::Stopped,
+                circuit_breaker_state: None,
+            };
+
+            if proc.config.options.auto_start {
+                state.status = Status::Starting;
+                chan.send(DaemonNotification::StateUpdate {
+                    id: proc.id,
+                    state: state.clone(),
+                })
+                .await;
+                runtime = Some(run_process(&proc.config)?);
+            }
+
+            Ok(Self {
+                process: DaemonProcess {
+                    runtime,
+                    state,
+                    params: proc,
+                },
+                chan,
+            })
+        }
+
+        async fn process_action(&mut self, action: ProcessAction) {
+            match action {
+                ProcessAction::Start if self.process.runtime.is_none() => todo!(),
+                ProcessAction::Restart if self.process.runtime.is_some() => todo!(),
+                ProcessAction::Stop if self.process.runtime.is_some() => todo!(),
+                ProcessAction::OpenCircuitBreaker => todo!(),
+                ProcessAction::UpdateConfig(new_config) => todo!(),
+
+                _ => (),
+            }
+        }
+
+        async fn update_status_and_send(&mut self, new_status: Status) {
+            self.process.state.status = new_status.clone();
+
+            self.chan
+                .send(DaemonNotification::StateUpdate {
+                    id: self.process.params.id,
+                    state: self.process.state.clone(),
+                })
+                .await;
+        }
+
+        async fn work(mut self) {
+            loop {
+                let process_waiter = match self.process.runtime.as_mut() {
+                    Some(proc) => Either::Left(async { proc.child.wait().await }),
+                    None => Either::Right(pending::<std::io::Result<ExitStatus>>()),
+                };
+                tokio::select! {
+                    action = self.chan.recv() => {
+                        // ignore `ProcessWorkersManager` crash for now
+                        if let Some(action) = action {
+                            self.process_action(action).await;
+                        }
+                    }
+
+                    proc_exit_result = process_waiter => {
+                        match proc_exit_result {
+                            Ok(result) => {
+                                self.update_status_and_send(Status::Crashed { code: result.code() }).await;
+                            },
+
+                            Err(_) => {
+                                self.update_status_and_send(Status::Crashed { code: None }).await;
+
+                            }
+                        }
+
+                        if self.process.params.config.options.auto_restart {
+
+
+                        }
+
+
+                    }
+
+
+
+                }
+            }
+        }
+
+        pub fn into_worker(mut self) -> impl Future<Output = ()> {}
+    }
+
+    pub struct ProcessSupervisorHandle {}
+
+    pub struct ProcessWorkersManager {}
+
+    impl ProcessWorkersManager {}
+}
+
+use shared::{formats::Toml, *};
+use tokio::sync::broadcast;
+pub struct Daemon<F: BytesFormat> {
+    proc_configs: config::Manager<F, Vec<Process>>,
+
+    log_pipe: broadcast::Receiver<Log>,
+}
+
+impl<F: BytesFormat> Daemon<F> {
+    pub async fn new(mut config: config::Manager<F, Vec<Process>>) {
+        let proc_configs = config.read().await.unwrap();
+
+        // for config in proc_configs.iter() {
+        //     let runtime = Self::run_process(&config.config).unwrap();
+        //     let daemon_proc = DaemonProcess {
+        //         runtime,
+        //         state: ProcessState {
+        //             status: Status::Starting,
+        //             circuit_breaker_state: None,
+        //         },
+        //     };
+
+        //     processes.insert(config.id, daemon_proc);
+        // }
     }
 }
 

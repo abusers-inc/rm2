@@ -129,6 +129,7 @@ name = "daemon"
 version = "0.1.0"
 dependencies = [
  "cond",
+ "futures",
  "homedir",
  "interprocess",
  "serde",
